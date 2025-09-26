@@ -16,4 +16,3 @@ jobs:
           base: main        # 上游仓库的基础分支
           head: main        # 你的 fork 仓库的头部分支
           token: ${{ secrets.PERSONAL_TOKEN }} # 必须使用具有 repo/public_repo 权限的 PAT
-          merge_method: rebase                # 使用 rebase 方式，使历史更接近上游

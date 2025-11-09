@@ -1,0 +1,137 @@
+name: Simple Release
+
+on:
+  # 1. 支持手动触发，方便测试和特殊版本发布
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'BetterGI Version (eg: 0.35.1, 0.36.5-alpha.1)'
+        required: true
+        type: string
+      create-release:
+        type: boolean
+        description: '创建 GitHub Release'
+        required: true
+        default: true
+  # 2. 支持推送标签时自动触发，这是标准的自动化发布方式
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # Job 1: 验证版本号格式
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      # 将验证后的版本号输出，供其他 Job 使用
+      version: ${{ steps.set-version.outputs.version }}
+      is_tag: ${{ steps.set-version.outputs.is_tag }}
+    steps:
+      - name: Set version from input or tag
+        id: set-version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # 手动触发时，验证输入的版本号格式
+            if ! [[ "${{ github.event.inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+              echo "❌ 错误：版本格式必须符合语义化版本规范 (例如: 1.2.3, 1.2.3-alpha, 1.2.3+build.123)"
+              exit 1
+            fi
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+            echo "✨ 手动触发构建，版本号：${{ github.event.inputs.version }}"
+          else
+            # 推送标签时，从 tag 名中提取版本号 (去掉 'v' 前缀)
+            VERSION=${GITHUB_REF#refs/tags/v}
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+            echo "🏷️ 从 tag 触发构建，版本号：${VERSION}"
+          fi
+
+  # Job 2: 核心构建任务
+  build_dist:
+    runs-on: windows-latest
+    needs: validate
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.x
+
+      - name: Update version in csproj
+        run: |
+          $version = '${{ needs.validate.outputs.version }}'
+          (Get-Content BetterGenshinImpact/BetterGenshinImpact.csproj) -replace '<Version>.*</Version>', "<Version>$version</Version>" | Set-Content BetterGenshinImpact/BetterGenshinImpact.csproj
+          echo "✅ 版本号已更新为 $version"
+
+      # 【运维建议】原工作流中有一个自动提交版本号的步骤。
+      # 在 fork 的项目中，这可能会导致意外提交到你的 main 分支。
+      # 我已将其移除，以保持流程简洁和安全。发布时版本号仅在构建包中更新。
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: 🛠️ Build application
+        run: dotnet publish BetterGenshinImpact/BetterGenshinImpact.csproj -c Release -p:PublishProfile=FolderProfile -p:Version=${{ needs.validate.outputs.version }}
+
+      - name: 🧹 Clean and Move Files
+        run: |
+          $sourceDir = ".\BetterGenshinImpact\bin\x64\Release\net8.0-windows10.0.22621.0\publish\win-x64"
+          # 移除不必要的文件以减小体积
+          Get-ChildItem -Path $sourceDir -Recurse -Filter "*.lib" | Remove-Item -Force
+          Get-ChildItem -Path $sourceDir -Recurse -Filter "*ffmpeg*.dll" | Remove-Item -Force
+          Get-ChildItem -Path $sourceDir -Recurse -Filter "*.pdb" | Remove-Item -Force
+          New-Item -Path "dist/BetterGI" -ItemType Directory -Force
+          xcopy "$sourceDir\*" ".\dist\BetterGI\" /E /H /I /Y
+
+      - name: 📦 Generate archive
+        run: |
+          cd dist
+          7z a "BetterGI_v${{ needs.validate.outputs.version }}.7z" BetterGI -t7z -mx=5 -mf=BCJ2 -r -y
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterGI_7z
+          path: dist/BetterGI_*.7z
+          retention-days: 7 # 构件保留7天，足够用于发布
+
+  # Job 3: 创建 GitHub Release
+  create_release:
+    # 只有在手动触发并勾选了创建release，或者通过tag触发时才运行
+    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.create-release == 'true') || needs.validate.outputs.is_tag == 'true'
+    needs: [validate, build_dist]
+    runs-on: ubuntu-latest
+    permissions:
+      # 必须授予写入权限，才能创建Release
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: BetterGI_7z
+          path: artifacts
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          # 从tag或手动输入中获取版本号
+          tag_name: v${{ needs.validate.outputs.version }}
+          name: BetterGI v${{ needs.validate.outputs.version }}
+          # 根据版本号是否包含'-'来判断是否为预发布版本
+          prerelease: ${{ contains(needs.validate.outputs.version, '-') }}
+          # 从tag触发时，直接发布为正式版；手动触发时，可自行决定是否为草稿
+          draft: ${{ needs.validate.outputs.is_tag == 'false' }}
+          body: |
+            发布 BetterGI v${{ needs.validate.outputs.version }}
+            ---
+            自动构建发布。
+          files: |
+            artifacts/BetterGI_v*.7z
